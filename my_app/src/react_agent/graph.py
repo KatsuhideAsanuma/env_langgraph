@@ -15,7 +15,7 @@ from react_agent.configuration import Configuration
 from react_agent.state import InputState, State
 from react_agent.tools import TOOLS
 from react_agent.utils import load_chat_model
-
+from langchain_core.output_parsers import StrOutputParser
 # Define the function that calls the model
 
 
@@ -29,6 +29,8 @@ async def call_model(
     Args:
         state (State): The current state of the conversation.
         config (RunnableConfig): Configuration for the model run.
+    
+    If the user asks to 'summarize this conversation', please respond with exactly that phrase so I can provide a summary.
 
     Returns:
         dict: A dictionary containing the model's response message.
@@ -66,58 +68,64 @@ async def call_model(
     return {"messages": [response]}
 
 
-# Define a new graph
+# 要約機能を行う新しいノードを追加
+def summarize(state: State) -> Dict[str, List[AIMessage]]:
+    """Summarize the conversation so far."""
+    messages = state.messages
+    chat_history = "\n".join([f"{msg.type}: {msg.content}" for msg in messages if hasattr(msg, 'content') and msg.content])
+    
+    llm = load_chat_model("anthropic/claude-3-5-sonnet")
+    prompt = f"Summarize this conversation briefly:\n{chat_history}"
+    summary_text = StrOutputParser().invoke(llm.invoke(prompt))
+    
+    # 要約結果をAIMessageとして返す
+    summary_message = AIMessage(content=f"Here's a summary of our conversation: {summary_text}")
+    return {"messages": [summary_message]}
 
+# グラフ定義 - 1つのbuilderのみ使用
 builder = StateGraph(State, input=InputState, config_schema=Configuration)
 
-# Define the two nodes we will cycle between
-builder.add_node(call_model)
+# 既存のノードを追加
+builder.add_node("agent", call_model)  # 名前を明示的に"agent"に変更
 builder.add_node("tools", ToolNode(TOOLS))
+builder.add_node("summarize", summarize)  # 新しいノードを追加
 
-# Set the entrypoint as `call_model`
-# This means that this node is the first one called
-builder.add_edge("__start__", "call_model")
+# エントリーポイントを設定
+builder.add_edge("__start__", "agent")
 
-
-def route_model_output(state: State) -> Literal["__end__", "tools"]:
-    """Determine the next node based on the model's output.
-
-    This function checks if the model's last message contains tool calls.
-
-    Args:
-        state (State): The current state of the conversation.
-
-    Returns:
-        str: The name of the next node to call ("__end__" or "tools").
-    """
+# モデル出力のルーティング関数
+def route_model_output(state: State) -> Literal["__end__", "tools", "summarize"]:
+    """Determine the next node based on the model's output."""
     last_message = state.messages[-1]
     if not isinstance(last_message, AIMessage):
         raise ValueError(
             f"Expected AIMessage in output edges, but got {type(last_message).__name__}"
         )
-    # If there is no tool call, then we finish
-    if not last_message.tool_calls:
-        return "__end__"
-    # Otherwise we execute the requested actions
-    return "tools"
+    
+# 要約を明示的に要求した場合のルーティング
+    if isinstance(last_message.content, str) and any(phrase in last_message.content.lower() 
+                                               for phrase in ["summarize", "summary", "要約"]):
+        return "summarize"
+    
+    # ツール呼び出しがあればツールノードへ
+    if last_message.tool_calls:
+        return "tools"
+    
+    # それ以外は終了
+    return "__end__"
 
-
-# Add a conditional edge to determine the next step after `call_model`
+# 条件付きエッジを追加
 builder.add_conditional_edges(
-    "call_model",
-    # After call_model finishes running, the next node(s) are scheduled
-    # based on the output from route_model_output
+    "agent",
     route_model_output,
 )
 
-# Add a normal edge from `tools` to `call_model`
-# This creates a cycle: after using tools, we always return to the model
-builder.add_edge("tools", "call_model")
+# ツールから再度エージェントへ
+builder.add_edge("tools", "agent")
 
-# Compile the builder into an executable graph
-# You can customize this by adding interrupt points for state updates
-graph = builder.compile(
-    interrupt_before=[],  # Add node names here to update state before they're called
-    interrupt_after=[],  # Add node names here to update state after they're called
-)
-graph.name = "ReAct Agent"  # This customizes the name in LangSmith
+# 要約から再度エージェントへ
+builder.add_edge("summarize", "agent")
+
+# グラフのコンパイル
+graph = builder.compile()
+graph.name = "ReAct Agent with Summarization"  # 名前を更新

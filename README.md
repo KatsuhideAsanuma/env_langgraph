@@ -13,3 +13,6 @@ pip install -e .
 
 >set .env
 >don't forget igonore .env
+
+＞
+https://smith.langchain.com/studio/?baseUrl=https://potential-space-adventure-pg76x57gg6qh6xv6-2024.app.github.dev
